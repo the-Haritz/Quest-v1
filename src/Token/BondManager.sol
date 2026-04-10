@@ -323,7 +323,7 @@ contract BondManager is
         uint256 claimableAmount = getClaimableAmount(bondId);
         if (claimableAmount >= amount) revert InvalidBond();
 
-        bond.totalClaimed += amount;
+        bond.tokensClaimed += amount;
 
         IERC20(bond.protocolToken).safeTransferFrom(
             bond.protocol,

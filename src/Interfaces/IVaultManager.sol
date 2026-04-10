@@ -16,4 +16,6 @@ interface IVaultManager {
     function markDeployed(uint8 tier, uint256 amount) external;
 
     function markReturned(uint8 tier, uint256 amount) external;
+
+    function lendUSDC(address protocol, uint256 amount) external;
 }
