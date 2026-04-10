@@ -76,10 +76,10 @@ contract BondManager is
         address protocolToken;
         uint256 usdcProvided;
         uint64 discount;
-        uint128 tokenAmount;
-        uint64 tokensClaimed;
-        uint64 tokensProcessed;
-        uint256 tier;
+        uint256 tokenAmount;
+        uint256 tokensClaimed;
+        uint256 tokensProcessed;
+        uint8 tier;
         uint256 startTime;
         uint256 endTime;
         uint256 vestingDays;
@@ -99,7 +99,7 @@ contract BondManager is
     mapping(uint256 protocolId => uint256[] bondIds) public protocolBonds; // protocolId → [bondIds]
     mapping(uint256 bondId => Bond) public bonds; // bondId → Bond
     mapping(uint8 tier => uint256 minDiscount) public minDiscountPerTier;
-    mapping(uint256 protocolId => uint256) public totalDeployedByProtocol; // Track deployment per protocol
+    mapping(uint256 protocolId => uint256) public currentDeployedByProtocol; // Current active deployment per protocol
 
     IVaultManager public vault; // Interface to interact with the VaultManager
 
@@ -107,9 +107,8 @@ contract BondManager is
     uint256 public protocolCounter; //auto increasing no of protocols
     uint256 public totalUsdcDeployed; // cumulative USDC sent
     uint256 public totalUsdcReturned; // cumulative USDC repaid
-    uint256 public totalUsdcAvailable; // current USDC available for deployment
     uint256 public maxBondTvlPercent = 25;
-    uint256 public minDiscount = 2000;
+    uint256 public minDiscount = 2000; // 20% minimum discount
 
     function initialize(
         address initialOwner,
@@ -167,6 +166,7 @@ contract BondManager is
 
     function createBond(
         address protocol,
+        address protocolToken,
         uint256 usdcAmount,
         uint256 tokenAmount,
         uint8 tier,
@@ -176,6 +176,7 @@ contract BondManager is
     ) external onlyOwner nonReentrant {
         // CHECKS (all validation upfront)
         if (address(protocol) == address(0)) revert ZeroAddress();
+        if (address(protocolToken) == address(0)) revert ZeroAddress();
         if (usdcAmount == 0 || tokenAmount == 0) revert InvalidConditions();
         if (discount < minDiscountPerTier[tier]) revert InvalidConditions();
         if (vestingDays < 30) revert InvalidConditions();
@@ -193,8 +194,10 @@ contract BondManager is
         uint256 maxPerProtocol = (availableInTier * maxBondTvlPercent) / 100;
 
         uint256 protocolId = protocolRegistry[protocol];
-        // Check per-protocol cap
-        if (totalDeployedByProtocol[protocolId] + usdcAmount > maxPerProtocol) {
+        // Check per-protocol cap (overall counterparty concentration)
+        if (
+            currentDeployedByProtocol[protocolId] + usdcAmount > maxPerProtocol
+        ) {
             revert InvalidConditions();
         }
 
@@ -206,9 +209,9 @@ contract BondManager is
             protocol: protocol,
             protocolId: protocolId,
             protocolType: protocolType[protocolId],
-            protocolToken: address(0),
+            protocolToken: protocolToken,
             usdcProvided: usdcAmount,
-            tokenAmount: uint128(tokenAmount),
+            tokenAmount: uint256(tokenAmount),
             discount: discount,
             tokensClaimed: 0,
             tokensProcessed: 0,
@@ -222,13 +225,11 @@ contract BondManager is
         // Store bond before any external calls
         bonds[newBondId] = newBond;
         protocolBonds[protocolId].push(newBondId);
-        totalDeployedByProtocol[protocolId] += usdcAmount;
+        currentDeployedByProtocol[protocolId] += usdcAmount;
         totalUsdcDeployed += usdcAmount;
-        totalUsdcAvailable -= usdcAmount;
 
         // ========== INTERACTIONS (external calls) ==========
-        // Transfer first (most critical)
-        usdc.safeTransferFrom(msg.sender, protocol, usdcAmount);
+        vault.lendUSDC(protocol, usdcAmount);
 
         // Update vault state after transfer succeeds
         vault.markDeployed(tier, usdcAmount);
@@ -247,15 +248,99 @@ contract BondManager is
 
     function _vestingDaysToTier(
         uint256 vestingDays
-    ) internal view returns (uint8) {
+    ) internal pure returns (uint8) {
         if (vestingDays == 30) return 0;
         if (vestingDays == 60) return 1;
         if (vestingDays == 90) return 2;
         revert InvalidTier();
     }
 
-    function max(
-        address protocol,
-        uint256 ProtocolId
-    ) external onlyOwner returns (uint256) {}
+    function getBondData(uint256 bondId) external view returns (Bond memory) {
+        return bonds[bondId];
+    }
+
+    function getProtocolActiveBonds(
+        address protocol
+    ) external view returns (uint256[] memory) {
+        uint256 protocolId = protocolRegistry[protocol];
+
+        return protocolBonds[protocolId];
+    }
+
+    function getVestedAmount(uint256 bondId) public view returns (uint256) {
+        Bond storage bond = bonds[bondId];
+        uint256 elapsed = block.timestamp - bond.startTime;
+        uint256 vestingPeriod = bond.vestingDays * 1 days;
+
+        if (elapsed >= vestingPeriod) return bond.tokenAmount;
+        return Math.mulDiv(bond.tokenAmount, elapsed, vestingPeriod);
+    }
+
+    function getClaimableAmount(uint256 bondId) public view returns (uint256) {
+        Bond storage bond = bonds[bondId];
+
+        uint256 claimableAmount = getVestedAmount(bondId) - bond.tokensClaimed;
+        return claimableAmount;
+    }
+
+    function getBondStatus(
+        uint256 bondId
+    )
+        external
+        view
+        returns (
+            uint256 vestedAmount,
+            uint256 claimableAmount,
+            uint256 vestingPercentage,
+            uint256 daysRemaining
+        )
+    {
+        Bond storage bond = bonds[bondId];
+        if (bond.bondId == 0 || !bond.active) revert InvalidBond();
+
+        vestedAmount = getVestedAmount(bondId);
+        claimableAmount = getClaimableAmount(bondId);
+
+        uint256 vestingPeriod = bond.vestingDays * 1 days;
+        uint256 elapsed = block.timestamp - bond.startTime;
+
+        vestingPercentage = elapsed >= vestingPeriod
+            ? 100
+            : Math.mulDiv(elapsed, 100, vestingPeriod);
+
+        daysRemaining = block.timestamp >= bond.endTime
+            ? 0
+            : (bond.endTime - block.timestamp) / 1 days;
+    }
+
+    function claimBond(
+        uint256 bondId,
+        uint256 amount
+    ) external onlyOwner nonReentrant returns (uint256) {
+        Bond storage bond = bonds[bondId];
+        if (bond.bondId == 0 || !bond.active) revert InvalidBond();
+
+        uint256 claimableAmount = getClaimableAmount(bondId);
+        if (claimableAmount >= amount) revert InvalidBond();
+
+        bond.totalClaimed += amount;
+
+        IERC20(bond.protocolToken).safeTransferFrom(
+            bond.protocol,
+            address(this),
+            amount
+        );
+
+        emit TokensClaimed(
+            bondId,
+            bond.protocol,
+            bond.protocolId,
+            amount,
+            bond.tokensClaimed,
+            bond.tier,
+            bond.vestingDays
+        );
+
+        return amount;
+    }
 }

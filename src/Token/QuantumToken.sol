@@ -271,6 +271,11 @@ contract QVToken is
         }
     }
 
+    function lendUSDC(address to, uint256 amount) external {
+        require(vaultManager.isManager(msg.sender), "Not authorized");
+        usdc.safeTransfer(to, amount);
+    }
+
     function getMyDeposits(
         address user
     ) external view returns (DepositReceipt[] memory) {
