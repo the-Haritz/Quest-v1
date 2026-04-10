@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "src/Interfaces/IVaultManager.sol";
+import "src/Interfaces/IDexRouter.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
@@ -60,6 +61,11 @@ contract BondManager is
         address indexed protocol,
         ProtocolType protocolType
     );
+    event ProtocolDeRegistered(
+        uint256 indexed protocolId,
+        address indexed protocol,
+        ProtocolType protocolType
+    );
 
     enum ProtocolType {
         LENDING,
@@ -85,34 +91,42 @@ contract BondManager is
         uint256 vestingDays;
         bool active;
     }
+    struct Protocol {
+        address protocol;
+        ProtocolType protocolType;
+    }
 
     error ZeroAddress();
     error InvalidProtocol();
     error InvalidProtocolType();
     error ProtocolExists();
+    error InactiveProtocol();
     error InvalidTier();
     error InvalidBond();
     error InvalidConditions();
 
     mapping(address protocol => uint256 protocolId) public protocolRegistry; // protocol address → protocolId
     mapping(uint256 protocolId => ProtocolType) public protocolType; // protocolId → ProtocolType
+    mapping(uint256 protocolId => bool isActive) public protocolActive;
     mapping(uint256 protocolId => uint256[] bondIds) public protocolBonds; // protocolId → [bondIds]
     mapping(uint256 bondId => Bond) public bonds; // bondId → Bond
     mapping(uint8 tier => uint256 minDiscount) public minDiscountPerTier;
     mapping(uint256 protocolId => uint256) public currentDeployedByProtocol; // Current active deployment per protocol
 
     IVaultManager public vault; // Interface to interact with the VaultManager
+    IDexRouter public dexRouter; // Interface to interact with dexRouter
 
     uint256 public bondCounter; // auto-increment bond IDs
     uint256 public protocolCounter; //auto increasing no of protocols
     uint256 public totalUsdcDeployed; // cumulative USDC sent
     uint256 public totalUsdcReturned; // cumulative USDC repaid
-    uint256 public maxBondTvlPercent = 25;
+    uint256 public maxBondTvlPercent = 25; // default, can be updated
     uint256 public minDiscount = 2000; // 20% minimum discount
 
     function initialize(
         address initialOwner,
         IVaultManager _vault,
+        address _dexRouter,
         address _usdc
     ) external initializer {
         if (
@@ -128,6 +142,8 @@ contract BondManager is
 
         usdc = IERC20(_usdc);
         vault = _vault;
+        dexRouter = IDexRouter(_dexRouter);
+
         minDiscountPerTier[0] = 3000; // 30 days: 30% min discount
         minDiscountPerTier[1] = 2500; // 60 days: 25% min discount
         minDiscountPerTier[2] = 2000; // 90 days: 20% min discount
@@ -162,6 +178,31 @@ contract BondManager is
         uint256 newProtocolId = ++protocolCounter;
         protocolRegistry[protocol] = newProtocolId;
         protocolType[newProtocolId] = _protocolType;
+        protocolActive[newProtocolId] = true;
+    }
+
+    function _deRegisterProtocol(
+        address protocol,
+        ProtocolType _protocolType
+    ) internal {
+        if (address(protocol) == address(0)) revert ZeroAddress();
+        uint256 protocolId = protocolRegistry[protocol];
+        protocolActive[protocolId] = false;
+
+        emit ProtocolDeRegistered(
+            protocolRegistry[protocol],
+            protocol,
+            _protocolType
+        );
+    }
+
+    function deregisterProtocol(address protocol) external onlyOwner {
+        if (address(protocol) == address(0)) revert ZeroAddress();
+        if (protocolRegistry[protocol] == 0) revert InvalidProtocol();
+
+        uint256 protocolId = protocolRegistry[protocol];
+        ProtocolType pType = protocolType[protocolId];
+        _deRegisterProtocol(protocol, pType);
     }
 
     function createBond(
@@ -186,6 +227,9 @@ contract BondManager is
             _registerProtocolInternal(protocol, protocolType_);
         }
 
+        uint256 protocolId = protocolRegistry[protocol];
+        if (!protocolActive[protocolId]) revert InactiveProtocol();
+
         uint8 computedTier = _vestingDaysToTier(vestingDays);
         if (computedTier != tier) revert InvalidTier();
 
@@ -193,7 +237,6 @@ contract BondManager is
         uint256 availableInTier = vault.getProtocolAvailableByTier(tier);
         uint256 maxPerProtocol = (availableInTier * maxBondTvlPercent) / 100;
 
-        uint256 protocolId = protocolRegistry[protocol];
         // Check per-protocol cap (overall counterparty concentration)
         if (
             currentDeployedByProtocol[protocolId] + usdcAmount > maxPerProtocol
@@ -262,6 +305,7 @@ contract BondManager is
     function getProtocolActiveBonds(
         address protocol
     ) external view returns (uint256[] memory) {
+        if (address(protocol) == address(0)) revert ZeroAddress();
         uint256 protocolId = protocolRegistry[protocol];
 
         return protocolBonds[protocolId];
@@ -269,6 +313,8 @@ contract BondManager is
 
     function getVestedAmount(uint256 bondId) public view returns (uint256) {
         Bond storage bond = bonds[bondId];
+        if (bond.bondId == 0 || !bond.active) revert InvalidBond();
+
         uint256 elapsed = block.timestamp - bond.startTime;
         uint256 vestingPeriod = bond.vestingDays * 1 days;
 
@@ -278,6 +324,7 @@ contract BondManager is
 
     function getClaimableAmount(uint256 bondId) public view returns (uint256) {
         Bond storage bond = bonds[bondId];
+        if (bond.bondId == 0 || !bond.active) revert InvalidBond();
 
         uint256 claimableAmount = getVestedAmount(bondId) - bond.tokensClaimed;
         return claimableAmount;
@@ -319,9 +366,10 @@ contract BondManager is
     ) external onlyOwner nonReentrant returns (uint256) {
         Bond storage bond = bonds[bondId];
         if (bond.bondId == 0 || !bond.active) revert InvalidBond();
+        if (amount == 0) revert InvalidConditions();
 
         uint256 claimableAmount = getClaimableAmount(bondId);
-        if (claimableAmount >= amount) revert InvalidBond();
+        if (amount > claimableAmount) revert InvalidConditions();
 
         bond.tokensClaimed += amount;
 
@@ -342,5 +390,93 @@ contract BondManager is
         );
 
         return amount;
+    }
+
+    function setMaxBondTvlPercent(uint256 newPercent) public onlyOwner {
+        if (newPercent == 0 || newPercent > 100) revert InvalidConditions();
+        maxBondTvlPercent = newPercent;
+    }
+
+    function sellBondTokens(
+        uint256 bondId,
+        uint256 amount,
+        uint256 minUsdcOut,
+        address rewardPool
+    )
+        external
+        onlyOwner
+        nonReentrant
+        returns (uint256 usdcReceived, uint256 profit)
+    {
+        // CHECKS
+        Bond storage bond = bonds[bondId];
+        if (bond.bondId == 0 || !bond.active) revert InvalidBond();
+        if (amount == 0) revert InvalidConditions();
+        if (rewardPool == address(0)) revert ZeroAddress();
+
+        // amount must not exceed claimed but unprocessed tokens
+        uint256 availableToSell = bond.tokensClaimed - bond.tokensProcessed;
+        if (amount > availableToSell) revert InvalidConditions();
+
+        // EFFECTS
+        bond.tokensProcessed += amount;
+
+        // Mark bond inactive if fully processed
+        if (bond.tokensProcessed == bond.tokenAmount) {
+            bond.active = false;
+            currentDeployedByProtocol[bond.protocolId] -= bond.usdcProvided;
+            totalUsdcReturned += bond.usdcProvided;
+            vault.markReturned(bond.tier, bond.usdcProvided);
+        }
+
+        // INTERACTIONS - approve router and swap
+        IERC20(bond.protocolToken).safeIncreaseAllowance(
+            address(dexRouter),
+            amount
+        );
+
+        address[] memory path = new address[](2);
+        path[0] = bond.protocolToken;
+        path[1] = address(usdc);
+
+        uint256[] memory amounts = dexRouter.swapExactTokensForTokens(
+            amount,
+            minUsdcOut,
+            path,
+            address(this),
+            block.timestamp + 300
+        );
+
+        usdcReceived = amounts[amounts.length - 1];
+
+        // PROFIT CALCULATION - fill this in yourself
+        // cost basis per token = bond.usdcProvided / bond.tokenAmount
+        // cost of tokens sold = amount * costBasisPerToken
+        // profit = usdcReceived - costOfTokensSold
+        // use Math.mulDiv to avoid overflow
+        uint256 costOfTokensSold = Math.mulDiv(
+            bond.usdcProvided,
+            amount,
+            bond.tokenAmount
+        );
+        profit = usdcReceived > costOfTokensSold
+            ? usdcReceived - costOfTokensSold
+            : 0;
+
+        // Send profit to RewardPool
+        if (profit > 0) {
+            usdc.safeTransfer(rewardPool, profit);
+        }
+
+        emit TokensSold(
+            bondId,
+            bond.protocol,
+            bond.protocolId,
+            amount,
+            bond.tokensProcessed,
+            usdcReceived,
+            bond.tier,
+            bond.vestingDays
+        );
     }
 }
