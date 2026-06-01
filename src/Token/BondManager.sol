@@ -92,7 +92,7 @@ contract BondManager is
         bool active;
     }
     struct Protocol {
-        address protocol;
+        address protocol;   
         ProtocolType protocolType;
     }
 
@@ -120,6 +120,7 @@ contract BondManager is
     uint256 public protocolCounter; //auto increasing no of protocols
     uint256 public totalUsdcDeployed; // cumulative USDC sent
     uint256 public totalUsdcReturned; // cumulative USDC repaid
+    //uint256 public totalUsdcRecovered; // cumulative USDC recovered from protocols that go dark
     uint256 public maxBondTvlPercent = 25; // default, can be updated
     uint256 public minDiscount = 2000; // 20% minimum discount
 
@@ -449,7 +450,7 @@ contract BondManager is
 
         usdcReceived = amounts[amounts.length - 1];
 
-        // PROFIT CALCULATION - fill this in yourself
+        // PROFIT CALCULATIOn  
         // cost basis per token = bond.usdcProvided / bond.tokenAmount
         // cost of tokens sold = amount * costBasisPerToken
         // profit = usdcReceived - costOfTokensSold
@@ -477,6 +478,49 @@ contract BondManager is
             usdcReceived,
             bond.tier,
             bond.vestingDays
+        );
+    }
+    
+
+    function emergencyExitBond(uint256 bondId, uint256 minUsdcOut, address rewardPool) external onlyOwner nonReentrant {
+        Bond storage bond = bonds[bondId];
+        if (bond.bondId == 0 || !bond.active) revert InvalidBond();
+        if (rewardPool == address(0)) revert ZeroAddress();
+        
+        // Only recover tokens that HAVE VESTED but haven't been CLAIMED
+        uint256 vestedAmount = getVestedAmount(bondId);
+        uint256 unclaimedVested = vestedAmount - bond.tokensClaimed;
+        bond.tokensClaimed += unclaimedVested;
+    
+
+        bond.active = false;
+        
+        if (unclaimedVested > 0) {
+            IERC20(bond.protocolToken).safeTransferFrom(
+                bond.protocol,
+                address(this),
+                unclaimedVested
+            );
+            
+            // Owner decides to sell or not via separate sellBondTokens call
+            // or can leave tokens in contract for manual recovery
+        }
+        
+        // Update deployment tracking (protocol no longer owes USDC interest)
+        currentDeployedByProtocol[bond.protocolId] -= bond.usdcProvided;
+        
+        vault.markReturned(bond.tier, bond.usdcProvided);
+        //@note not make sense for usdc returned to increase by usdc provided since the bond was emergency exited...
+    
+        
+        // Owner can still manually call sellBondTokens() if profitable
+        // or leave tokens sitting in contract for manual recovery
+
+        emit BondExited(
+            bond.bondId,
+            bond.protocol,
+            bond.protocolId,
+            bond.usdcProvided
         );
     }
 }
