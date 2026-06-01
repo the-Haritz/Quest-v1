@@ -16,7 +16,8 @@ contract QVToken is
     ERC20Upgradeable,
     OwnableUpgradeable,
     PausableUpgradeable,
-    ReentrancyGuard
+    ReentrancyGuard,
+    IVaultManager
 {
     using SafeERC20 for IERC20;
 
@@ -28,25 +29,12 @@ contract QVToken is
     error MaxTVLExceeded(uint256 maxTVL, uint256 attemptedTVL);
     error FundsLockedUntil(uint256 unlockTimestamp);
 
-    enum LockupPeriod {
-        THIRTY_DAYS,
-        SIXTY_DAYS,
-        NINETY_DAYS
-    }
-
     IERC20 public usdc;
     IVaultManager public vaultManager;
-
     uint256 public totalDeposited;
+    uint256 public totalWeightedSupply;
     uint256 public minDeposit;
     uint256 public maxTVL;
-
-    struct DepositReceipt {
-        uint256 amount;
-        LockupPeriod tier;
-        uint256 lockupEnd;
-        bool expiryCounted;
-    }
 
     mapping(address => DepositReceipt[]) public userDeposits; // a user's total deposits
     mapping(LockupPeriod => uint256) public totalLockedByTier; // total capital locked per tier
@@ -117,7 +105,8 @@ contract QVToken is
                 amount: assets,
                 tier: lockupPeriod,
                 lockupEnd: lockupEnd,
-                expiryCounted: false
+                expiryCounted: false,
+                rewardDebt: 0
             })
         );
         totalLockedByTier[lockupPeriod] += assets;
@@ -127,6 +116,7 @@ contract QVToken is
         qtkMinted = assets;
         _mint(msg.sender, qtkMinted);
         totalDeposited = newTVL;
+        totalWeightedSupply += Math.mulDiv(assets, _multiplier(lockupPeriod), 1e18);
 
         emit Deposited(msg.sender, assets, lockupPeriod, lockupEnd);
 
@@ -162,27 +152,34 @@ contract QVToken is
 
         uint256 withdrawableAmount = 0;
         uint256 amountToWithdraw = assets;
+        uint256 weightToReduce = 0;
 
-        // SINGLE LOOP - do everything in one pass
+        // Calculate total withdrawable first
+        for (uint256 i = 0; i < len; ++i) {
+            if (block.timestamp >= deposits[i].lockupEnd && deposits[i].amount > 0) {
+                withdrawableAmount += deposits[i].amount;
+            }
+        }
+
+        if (assets > withdrawableAmount) revert InsufficientBalance();
+
+        // SINGLE LOOP - track actual weight deduction based on deposit tier
         for (uint256 i = 0; i < len; ++i) {
             DepositReceipt storage userDeposit = deposits[i];
 
-            // 1. Skip locked deposits (allow withdrawal from expired ones only)
+            // Skip locked deposits (allow withdrawal from expired ones only)
             if (block.timestamp < userDeposit.lockupEnd) {
                 continue;
             }
 
-            // 3. Sum withdrawable (expired deposits with funds)
-            if (userDeposit.amount > 0) {
-                withdrawableAmount += userDeposit.amount;
-            }
-
-            // 4. Mark as withdrawn (deduct from receipt, FIFO style)
+            // Mark as withdrawn (deduct from receipt, FIFO style)
             if (amountToWithdraw > 0 && userDeposit.amount > 0) {
-                uint256 deductFromThisDeposit = userDeposit.amount >
-                    amountToWithdraw
+                uint256 deductFromThisDeposit = userDeposit.amount > amountToWithdraw
                     ? amountToWithdraw
                     : userDeposit.amount;
+
+                // Track weight reduction for THIS specific deposit's tier
+                weightToReduce += Math.mulDiv(deductFromThisDeposit, _multiplier(userDeposit.tier), 1e18);
 
                 userDeposit.amount -= deductFromThisDeposit;
                 totalLockedByTier[userDeposit.tier] -= deductFromThisDeposit;
@@ -190,11 +187,10 @@ contract QVToken is
             }
         }
 
-        if (assets > withdrawableAmount) revert InsufficientBalance();
-
         qtkBurned = assets;
         _burn(msg.sender, qtkBurned);
         totalDeposited -= assets;
+        totalWeightedSupply -= weightToReduce;
         usdc.safeTransfer(receiver, assets);
 
         emit Withdrawn(msg.sender, receiver, assets);
@@ -219,12 +215,13 @@ contract QVToken is
     // PUBLIC - user can query their deposits by tier
     function getUserAvailableByTier(
         address user,
-        LockupPeriod tier
+        uint8 tier
     ) external view returns (uint256 available) {
+        LockupPeriod lockupTier = LockupPeriod(tier);
         DepositReceipt[] storage deposits = userDeposits[user];
         for (uint256 i = 0; i < deposits.length; i++) {
             if (
-                deposits[i].tier == tier &&
+                deposits[i].tier == lockupTier &&
                 block.timestamp >= deposits[i].lockupEnd &&
                 deposits[i].amount > 0
             ) {
@@ -236,35 +233,41 @@ contract QVToken is
 
     // ADMIN - protocol-level queries
     function getProtocolLockedByTier(
-        LockupPeriod tier
+        uint8 tier
     ) external view onlyOwner returns (uint256) {
-        return totalLockedByTier[tier];
+        LockupPeriod lockupTier = LockupPeriod(tier);
+        return totalLockedByTier[lockupTier];
     }
 
     function getProtocolDeployedByTier(
-        LockupPeriod tier
+        uint8 tier
     ) external view onlyOwner returns (uint256) {
-        return totalDeployedByTier[tier];
+        LockupPeriod lockupTier = LockupPeriod(tier);
+        return totalDeployedByTier[lockupTier];
     }
 
     function getProtocolAvailableByTier(
-        LockupPeriod tier
+        uint8 tier
     ) external view onlyOwner returns (uint256) {
-        return totalLockedByTier[tier] - totalDeployedByTier[tier];
+        LockupPeriod lockupTier = LockupPeriod(tier);
+        return totalLockedByTier[lockupTier] - totalDeployedByTier[lockupTier];
     }
 
     // STATE-MUTATING - for BondManager
-    function markDeployed(LockupPeriod tier, uint256 amount) external {
+    function markDeployed(uint8 tier, uint256 amount) external {
         require(vaultManager.isManager(msg.sender), "Not authorized");
-        if (amount > totalLockedByTier[tier] - totalDeployedByTier[tier])
+        LockupPeriod lockupTier = LockupPeriod(tier);
+        if (amount > totalLockedByTier[lockupTier] - totalDeployedByTier[lockupTier])
             revert InsufficientBalance();
-        totalDeployedByTier[tier] += amount;
+        totalDeployedByTier[lockupTier] += amount;
     }
 
-    function markReturned(LockupPeriod tier, uint256 amount) external {
+
+    function markReturned(uint8 tier, uint256 amount) external {
         require(vaultManager.isManager(msg.sender), "Not authorized");
-        if (totalDeployedByTier[tier] >= amount) {
-            totalDeployedByTier[tier] -= amount;
+        LockupPeriod lockupTier = LockupPeriod(tier);
+        if (totalDeployedByTier[lockupTier] >= amount) {
+            totalDeployedByTier[lockupTier] -= amount;
             //available shouldn't increase by returned cause available is meant to be deployed and people might want to withdraw upon lock expiry...guess i have to resort to a reserve ratio being maintained and checked by the BondManager
         } else {
             revert InsufficientBalance();
@@ -276,10 +279,24 @@ contract QVToken is
         usdc.safeTransfer(to, amount);
     }
 
+    function isManager(address account) external view returns (bool) {
+        return account == owner();
+    }
+
     function getMyDeposits(
         address user
     ) external view returns (DepositReceipt[] memory) {
         return userDeposits[user];
+    }
+
+    function updateRewardDebt(
+        address user,
+        uint256 depositIndex,
+        uint256 newRewardDebt
+    ) external {
+        require(msg.sender == owner(), "Only owner can update reward debt");
+        require(depositIndex < userDeposits[user].length, "Invalid deposit index");
+        userDeposits[user][depositIndex].rewardDebt = newRewardDebt;
     }
 
     function setVaultManager(IVaultManager newVaultManager) external onlyOwner {
@@ -325,5 +342,11 @@ contract QVToken is
         return weightedBalance;
     }
 
-    //my idea to make it such that users always have skin in the game by making sure that if a user seeks to withdraw >= 50% of principal, they must have an equivalent percentage of rewards immediately added to withdrawn falls apart, as said user could just reinvest the withdrawn rewards and a circular redundant path is created...
+    
+
+    function getTotalWeightedBalance() external view returns (uint256) {
+        return totalWeightedSupply;
+    }
+
+    //my idea to make it such that users always have skin in the game by making sure that if a user seeks to withdraw >= 50% of principal, they must have an equivalent percentage of rewards immediately added to withdrawn but that idea falls apart because as said user could just reinvest the withdrawn rewards and a circular redundant path is created...
 }
