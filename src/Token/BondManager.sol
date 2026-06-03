@@ -12,11 +12,36 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title BondManager - Quest Protocol Partnerships
-/// @author Quest Team
-/// @notice Manages protocol partnerships, capital deployment via bonds, vesting, and profit extraction
-/// @dev Implements bond lifecycle: register → create → vest → claim → sell → return capital.
-/// Profits are extracted from token appreciation and sent to RewardPool for user distribution.
+/// @title BondManager
+/// @notice Manages protocol partnerships through bonds: capital deployment, vesting, and profit extraction
+/// @dev Core contract for Quest Protocol V1 MVP. Orchestrates capital deployment to external protocols,
+///      token vesting schedules, and profit recovery through token swaps on DEX.
+///
+///      Bond Lifecycle:
+///      1. Protocol Registration: Owner registers protocol with type (LENDING/STAKING/YIELD/LAUNCHPAD)
+///      2. Bond Creation: Deploy USDC to protocol, receive vesting tokens in return (30/60/90 day vesting)
+///      3. Token Claiming: As tokens vest linearly, claim from protocol (pull tokens in)
+///      4. Profit Extraction: Swap claimed tokens on DEX for USDC, extract profit to RewardPool
+///      5. Bond Completion: When all tokens claimed+processed, mark inactive and release capital
+///      6. Emergency Exit: If protocol goes dark, emergency exit releases capital without full recovery
+///
+///      Capital Deployment Model:
+///      - Vault tracks available USDC per tier (totalLockedByTier - totalDeployedByTier)
+///      - BondManager deploys capital from available pool via vault.lendUSDC()
+///      - Marks deployment via vault.markDeployed(tier, amount) to reduce available capacity
+///      - Returns capital via vault.markReturned(tier, amount) when bond completes
+///      - Per-protocol concentration limit: max 25% of tier capacity to single protocol
+///
+///      Profit Extraction:
+///      - Cost basis per token = usdcProvided / tokenAmount
+///      - Profit = usdcReceived - (costBasis * tokenAmount)
+///      - Example: Deploy 1000 USDC at 20% discount, get 1000 tokens valued at 1250.
+///        Sell for 1200 USDC = 200 USDC profit routed to RewardPool for distribution.
+///
+///      Design Patterns:
+///      - CHECKS-EFFECTS-INTERACTIONS: Validate → Update state → External calls
+///      - Reentrancy Guards: nonReentrant on all state-changing functions
+///      - Access Control: onlyOwner for all critical operations
 contract BondManager is
     Initializable,
     OwnableUpgradeable,
@@ -24,96 +49,154 @@ contract BondManager is
     ReentrancyGuard
 {
     using SafeERC20 for IERC20;
+    
+    //============================================================================
+    // STATE VARIABLES
+    //============================================================================
+    
+    /// @notice USDC token (6 decimals) used for deployments and profit swaps
     IERC20 public usdc;
+    
+    /// @notice VaultManager interface for capacity queries and deployment tracking
+    IVaultManager public vault;
+    
+    /// @notice DEX router interface (Uniswap/PancakeSwap compatible) for token→USDC swaps
+    IDexRouter public dexRouter;
+    
+    //============================================================================
+    // PROTOCOL REGISTRY
+    //============================================================================
+    
+    /// @notice Maps protocol address → unique protocol ID (assigned during registration)
+    mapping(address protocol => uint256 protocolId) public protocolRegistry;
+    
+    /// @notice Maps protocol ID → protocol type (LENDING/STAKING/YIELD/LAUNCHPAD)
+    mapping(uint256 protocolId => ProtocolType) public protocolType;
+    
+    /// @notice Maps protocol ID → active flag (true=can create bonds, false=deregistered)
+    mapping(uint256 protocolId => bool isActive) public protocolActive;
+    
+    /// @notice Maps protocol ID → array of all bond IDs associated with protocol
+    mapping(uint256 protocolId => uint256[] bondIds) public protocolBonds;
+    
+    //============================================================================
+    // BOND STATE
+    //============================================================================
+    
+    /// @notice Maps bond ID → complete bond state (deployment, vesting, claims)
+    mapping(uint256 bondId => Bond) public bonds;
+    
+    /// @notice Maps tier (0/1/2) → minimum discount percentage required for that tier
+    /// @dev Tier 0 (30d): 30% min, Tier 1 (60d): 25% min, Tier 2 (90d): 20% min
+    mapping(uint8 tier => uint256 minDiscount) public minDiscountPerTier;
+    
+    /// @notice Maps protocol ID → current USDC deployed in active bonds
+    /// @dev Used to enforce per-protocol concentration limits (max 25% of tier capacity)
+    mapping(uint256 protocolId => uint256) public currentDeployedByProtocol;
+    
+    //============================================================================
+    // METRICS & CONFIG
+    //============================================================================
+    
+    /// @notice Auto-incrementing bond ID counter (starts from 1)
+    uint256 public bondCounter;
+    
+    /// @notice Auto-incrementing protocol ID counter (starts from 1)
+    uint256 public protocolCounter;
+    
+    /// @notice Cumulative USDC deployed across all bonds (lifetime metric)
+    uint256 public totalUsdcDeployed;
+    
+    /// @notice Cumulative USDC returned when bonds completed or exited (lifetime metric)
+    uint256 public totalUsdcReturned;
+    
+    /// @notice Maximum deployment per protocol as % of available tier capacity (default 25%)
+    /// @dev Example: If tier has 10k USDC available, max per protocol = 2.5k USDC
+    uint256 public maxBondTvlPercent = 25;
+    
+    /// @notice Fallback minimum discount (unused, tier-based minimums take precedence)
+    uint256 public minDiscount = 2000;
 
-    // ============ EVENTS ============
-
-    event VaultAddressUpdate(address oldVault, address vault);
-    event BondCreated(
-        uint256 indexed bondId,
-        address indexed protocol,
-        uint256 protocolId,
-        uint256 usdcAmount,
-        uint256 tokenAmount,
-        uint256 tier,
-        uint256 vestingDays
-    );
-    event TokensClaimed(
-        uint256 indexed bondId,
-        address indexed protocol,
-        uint256 protocolId,
-        uint256 amountClaimed,
-        uint256 totalClaimed,
-        uint256 tier,
-        uint256 vestingDays
-    );
-    event TokensSold(
-        uint256 indexed bondId,
-        address indexed protocol,
-        uint256 protocolId,
-        uint256 tokenAmount,
-        uint256 totalSold,
-        uint256 usdcReceived,
-        uint256 tier,
-        uint256 vestingDays
-    );
-    event BondExited(
-        uint256 indexed bondId,
-        address indexed protocol,
-        uint256 protocolId,
-        uint256 totalUsdcReturned
-    );
-    event ProtocolRegistered(
-        uint256 indexed protocolId,
-        address indexed protocol,
-        ProtocolType protocolType
-    );
-    event ProtocolDeRegistered(
-        uint256 indexed protocolId,
-        address indexed protocol,
-        ProtocolType protocolType
-    );
-
-    // ============ ENUMS ============
-
-    /// @notice Protocol classification for discount tier validation
+    //============================================================================
+    // ENUMS & STRUCTS
+    //============================================================================
+    
+    /// @notice Protocol category for classification and risk management
     enum ProtocolType {
-        LENDING,    // 0: Borrowing protocols (Aave, Compound)
-        STAKING,    // 1: Staking platforms (Lido, Rocket)
-        YIELD,      // 2: Yield farms (PancakeSwap, Uniswap)
-        LAUNCHPAD   // 3: Token launches (IDO platforms)
+        LENDING,    // Lending protocols (Aave, Compound, etc)
+        STAKING,    // Staking protocols (Lido, Rocket Pool, etc)
+        YIELD,      // Yield farming (Curve, Balancer, etc)
+        LAUNCHPAD   // Token launch/IDO platforms
     }
 
-    // ============ STRUCTS ============
-
-    /// @notice Complete bond lifecycle data
-    /// @dev Tracks deployment, vesting, claims, and sales for profit calculation
+    /// @notice Complete bond state: deployment, vesting, claims, and lifecycle
+    /// @dev Lifecycle: ACTIVE (on create) → INACTIVE (when fully processed or emergency exited)
+    ///      State transitions:
+    ///      - Created: tokensClaimed=0, tokensProcessed=0, active=true
+    ///      - After claimBond(): tokensClaimed increases
+    ///      - After sellBondTokens(): tokensProcessed increases
+    ///      - When tokensProcessed==tokenAmount: active=false (bond complete)
+    ///      - Emergency exit: active=false (capital released, tokens recoverable)
     struct Bond {
-        uint256 bondId;                // Unique bond identifier
-        address protocol;              // Protocol address (counterparty)
-        uint256 protocolId;            // Protocol registry ID
-        ProtocolType protocolType;     // Protocol classification
-        address protocolToken;         // Token protocol will provide
-        uint256 usdcProvided;          // USDC capital sent to protocol
-        uint64 discount;               // Discount percentage applied (e.g., 2000 = 20%)
-        uint256 tokenAmount;           // Total tokens protocol will provide
-        uint256 tokensClaimed;         // Tokens claimed from protocol so far
-        uint256 tokensProcessed;       // Tokens sold/processed so far
-        uint8 tier;                    // Lockup tier (0=30d, 1=60d, 2=90d)
-        uint256 startTime;             // Bond creation timestamp
-        uint256 endTime;               // Vesting end timestamp
-        uint256 vestingDays;           // Vesting duration
-        bool active;                   // Bond lifecycle status
+        /// @notice Unique bond identifier (auto-incrementing from 1)
+        uint256 bondId;
+        
+        /// @notice Protocol contract receiving USDC deployment
+        address protocol;
+        
+        /// @notice Internal protocol registry ID
+        uint256 protocolId;
+        
+        /// @notice Cached protocol type for efficient event emitting
+        ProtocolType protocolType;
+        
+        /// @notice Protocol's native ERC20 token being vested to us
+        address protocolToken;
+        
+        /// @notice USDC deployed to protocol (6 decimals, fixed at creation)
+        uint256 usdcProvided;
+        
+        /// @notice Discount applied at creation (e.g., 3000 = 30%)
+        uint64 discount;
+        
+        /// @notice Total protocol tokens received during full vesting (fixed at creation)
+        uint256 tokenAmount;
+        
+        /// @notice Protocol tokens claimed so far (increments via claimBond)
+        uint256 tokensClaimed;
+        
+        /// @notice Protocol tokens swapped for USDC (increments via sellBondTokens)
+        uint256 tokensProcessed;
+        
+        /// @notice Lockup tier: 0=30d, 1=60d, 2=90d (tier→discount mapping)
+        uint8 tier;
+        
+        /// @notice Timestamp bond created (vesting start)
+        uint256 startTime;
+        
+        /// @notice Timestamp vesting completes (startTime + vestingDays * 1 days)
+        uint256 endTime;
+        
+        /// @notice Total vesting period in days (30, 60, or 90 only)
+        uint256 vestingDays;
+        
+        /// @notice Bond active status: true=deployed capital tracked, false=capital released
+        bool active;
     }
-
-    /// @notice Protocol metadata
+    
+    /// @notice Protocol registration record
     struct Protocol {
-        address protocol;              // Protocol address
-        ProtocolType protocolType;     // Protocol type
+        /// @notice Protocol contract address
+        address protocol;
+        
+        /// @notice Protocol category (LENDING/STAKING/YIELD/LAUNCHPAD)
+        ProtocolType protocolType;
     }
 
-    // ============ ERRORS ============
-
+    //============================================================================
+    // ERRORS
+    //============================================================================
+    
     error ZeroAddress();
     error InvalidProtocol();
     error InvalidProtocolType();
@@ -123,63 +206,115 @@ contract BondManager is
     error InvalidBond();
     error InvalidConditions();
 
-    // ============ STATE VARIABLES ============
+    //============================================================================
+    // EVENTS
+    //============================================================================
 
-    /// @notice Protocol address → protocol ID mapping (registry)
-    mapping(address protocol => uint256 protocolId) public protocolRegistry;
+    /// @notice Emitted when vault address updated (typically never, used for migration)
+    /// @param oldVault Previous vault address
+    /// @param vault New vault address
+    event VaultAddressUpdate(address indexed oldVault, address indexed vault);
+    
+    /// @notice Emitted when bond created (capital deployed to protocol)
+    /// @param bondId Unique bond identifier
+    /// @param protocol Protocol receiving deployment
+    /// @param protocolId Internal protocol registry ID
+    /// @param usdcAmount USDC deployed (6 decimals)
+    /// @param tokenAmount Protocol tokens to vest over period
+    /// @param tier Lockup tier (0=30d, 1=60d, 2=90d)
+    /// @param vestingDays Total vesting period in days
+    event BondCreated(
+        uint256 indexed bondId,
+        address indexed protocol,
+        uint256 indexed protocolId,
+        uint256 usdcAmount,
+        uint256 tokenAmount,
+        uint256 tier,
+        uint256 vestingDays
+    );
+    
+    /// @notice Emitted when protocol tokens claimed from protocol during vesting
+    /// @param bondId Bond being claimed
+    /// @param protocol Protocol address
+    /// @param protocolId Internal protocol ID
+    /// @param amountClaimed Amount of tokens claimed in this transaction
+    /// @param totalClaimed Cumulative tokens claimed across all claims for this bond
+    /// @param tier Lockup tier
+    /// @param vestingDays Vesting period
+    event TokensClaimed(
+        uint256 indexed bondId,
+        address indexed protocol,
+        uint256 indexed protocolId,
+        uint256 amountClaimed,
+        uint256 totalClaimed,
+        uint256 tier,
+        uint256 vestingDays
+    );
+    
+    /// @notice Emitted when claimed tokens swapped for USDC via DEX, profit extracted
+    /// @param bondId Bond tokens sold
+    /// @param protocol Protocol address
+    /// @param protocolId Internal protocol ID
+    /// @param tokenAmount Protocol tokens swapped in this transaction
+    /// @param totalSold Cumulative tokens processed (claimed and swapped) for this bond
+    /// @param usdcReceived USDC obtained from DEX swap
+    /// @param tier Lockup tier
+    /// @param vestingDays Vesting period
+    event TokensSold(
+        uint256 indexed bondId,
+        address indexed protocol,
+        uint256 indexed protocolId,
+        uint256 tokenAmount,
+        uint256 totalSold,
+        uint256 usdcReceived,
+        uint256 tier,
+        uint256 vestingDays
+    );
+    
+    /// @notice Emitted when bond emergency exited (marked inactive, deployment released)
+    /// @param bondId Bond exited
+    /// @param protocol Protocol address
+    /// @param protocolId Internal protocol ID
+    /// @param totalUsdcReturned USDC marked as returned (released from deployed tracking)
+    event BondExited(
+        uint256 indexed bondId,
+        address indexed protocol,
+        uint256 indexed protocolId,
+        uint256 totalUsdcReturned
+    );
+    
+    /// @notice Emitted when new protocol registered and activated
+    /// @param protocolId Internal protocol ID assigned
+    /// @param protocol Protocol address
+    /// @param protocolType Category of protocol
+    event ProtocolRegistered(
+        uint256 indexed protocolId,
+        address indexed protocol,
+        ProtocolType indexed protocolType
+    );
+    
+    /// @notice Emitted when protocol deactivated (no new bonds allowed)
+    /// @param protocolId Internal protocol ID
+    /// @param protocol Protocol address
+    /// @param protocolType Protocol category
+    event ProtocolDeRegistered(
+        uint256 indexed protocolId,
+        address indexed protocol,
+        ProtocolType indexed protocolType
+    );
 
-    /// @notice Protocol ID → protocol type
-    mapping(uint256 protocolId => ProtocolType) public protocolType;
+    //============================================================================
+    // INITIALIZATION
+    //============================================================================
 
-    /// @notice Protocol ID → active status
-    mapping(uint256 protocolId => bool isActive) public protocolActive;
-
-    /// @notice Protocol ID → array of bond IDs
-    mapping(uint256 protocolId => uint256[] bondIds) public protocolBonds;
-
-    /// @notice Bond ID → bond struct
-    mapping(uint256 bondId => Bond) public bonds;
-
-    /// @notice Minimum discount percentage required for each tier (bps, e.g., 2000 = 20%)
-    mapping(uint8 tier => uint256 minDiscount) public minDiscountPerTier;
-
-    /// @notice Current USDC deployed per protocol (for concentration limits)
-    mapping(uint256 protocolId => uint256) public currentDeployedByProtocol;
-
-    /// @notice Vault reference (for capital queries and deployment tracking)
-    IVaultManager public vault;
-
-    /// @notice DEX router for token swaps (Uniswap/PancakeSwap interface)
-    IDexRouter public dexRouter;
-
-    /// @notice Auto-incrementing bond ID counter
-    uint256 public bondCounter;
-
-    /// @notice Auto-incrementing protocol ID counter
-    uint256 public protocolCounter;
-
-    /// @notice Total USDC deployed across all bonds (audit trail)
-    uint256 public totalUsdcDeployed;
-
-    /// @notice Total USDC returned from completed bonds (audit trail)
-    uint256 public totalUsdcReturned;
-
-    /// @notice Maximum % of available tier capacity per protocol (default 25%)
-    /// @dev Prevents single protocol from monopolizing a tier
-    uint256 public maxBondTvlPercent = 25;
-
-    /// @notice Global minimum discount across all tiers (20%)
-    uint256 public minDiscount = 2000;
-
-    // ============ INITIALIZATION ============
-
-    /// @notice Initialize BondManager with vault, DEX, and token references
-    /// @dev Sets up tier-specific discount minimums: 30%, 25%, 20% respectively
-    /// @param initialOwner Owner address (can create/manage bonds)
-    /// @param _vault IVaultManager contract (QVToken) for capital queries
-    /// @param _dexRouter DEX router contract for token swaps
-    /// @param _usdc USDC token contract address
+    /// @notice Initialize BondManager with vault, DEX router, and USDC references
+    /// @dev Sets up tier-based minimum discount requirements and prepares for bond operations
+    /// @param initialOwner Address with owner privileges (bonds, protocols, config)
+    /// @param _vault IVaultManager for capacity queries, deployment tracking, USDC transfers
+    /// @param _dexRouter IDexRouter (Uniswap/PancakeSwap compatible) for token→USDC swaps
+    /// @param _usdc USDC token address (6 decimals, stable coin)
     /// @custom:precondition All addresses must be non-zero
+    /// @custom:postcondition Tier minimums set (30d=30%, 60d=25%, 90d=20%), ready for operations
     function initialize(
         address initialOwner,
         IVaultManager _vault,
@@ -206,10 +341,15 @@ contract BondManager is
         minDiscountPerTier[2] = 2000; // 90 days: 20% min discount
     }
 
-    // ============ VAULT MANAGEMENT ============
+    //============================================================================
+    // VAULT MANAGEMENT
+    //============================================================================
 
-    /// @notice Update vault reference (admin only)
-    /// @param _newVault New IVaultManager address
+    /// @notice Update vault reference (typically for migration, rarely called)
+    /// @dev Can update to new vault without redeployment
+    /// @param _newVault New vault address
+    /// @custom:precondition _newVault must be non-zero
+    /// @custom:postcondition Vault reference updated, VaultAddressUpdate event emitted
     function setVault(IVaultManager _newVault) external onlyOwner {
         if (address(_newVault) == address(0)) revert ZeroAddress();
         address oldVault = address(vault);
@@ -217,14 +357,17 @@ contract BondManager is
         emit VaultAddressUpdate(oldVault, address(_newVault));
     }
 
-    // ============ PROTOCOL REGISTRATION ============
+    //============================================================================
+    // PROTOCOL MANAGEMENT
+    //============================================================================
 
-    /// @notice Register new protocol as partnership candidate (admin only)
-    /// @dev Whitelists protocol for bond creation
-    /// @param protocol Protocol address
-    /// @param _protocolType Classification (LENDING, STAKING, YIELD, LAUNCHPAD)
-    /// @custom:precondition Protocol must not already be registered
-    /// @custom:postcondition Protocol is whitelisted and active
+    /// @notice Register new protocol for capital deployment partnerships
+    /// @dev Protocol immediately activated; can be deregistered later.
+    ///      Auto-registration also occurs during createBond() for convenience.
+    /// @param protocol Protocol contract address
+    /// @param _protocolType Protocol category (LENDING/STAKING/YIELD/LAUNCHPAD)
+    /// @custom:precondition protocol must be non-zero; not already registered
+    /// @custom:postcondition Protocol ID assigned and activated, ProtocolRegistered emitted
     function registerProtocol(
         address protocol,
         ProtocolType _protocolType
@@ -240,7 +383,11 @@ contract BondManager is
         );
     }
 
-    /// @notice Internal protocol registration logic
+    /// @notice Internal helper to register protocol and assign auto-incrementing ID
+    /// @dev Called by registerProtocol() and createBond() (auto-register)
+    /// @param protocol Protocol address
+    /// @param _protocolType Protocol category
+    /// @custom:postcondition protocolRegistry, protocolType, protocolActive updated
     function _registerProtocolInternal(
         address protocol,
         ProtocolType _protocolType
@@ -251,7 +398,11 @@ contract BondManager is
         protocolActive[newProtocolId] = true;
     }
 
-    /// @notice Internal protocol deregistration logic
+    /// @notice Deactivate protocol (prevents new bonds, existing bonds unaffected)
+    /// @dev Sets active flag false; existing bonds still tracked but no new bonds allowed
+    /// @param protocol Protocol address
+    /// @param _protocolType Protocol category (for event)
+    /// @custom:postcondition protocolActive set to false, ProtocolDeRegistered emitted
     function _deRegisterProtocol(
         address protocol,
         ProtocolType _protocolType
@@ -267,8 +418,11 @@ contract BondManager is
         );
     }
 
-    /// @notice Deregister protocol (remove from partnerships) (admin only)
-    /// @param protocol Protocol address to deregister
+    /// @notice Deregister active protocol
+    /// @dev Prevents new bonds with this protocol; existing bonds track state normally
+    /// @param protocol Protocol address
+    /// @custom:precondition protocol must be registered
+    /// @custom:postcondition Protocol marked inactive
     function deregisterProtocol(address protocol) external onlyOwner {
         if (address(protocol) == address(0)) revert ZeroAddress();
         if (protocolRegistry[protocol] == 0) revert InvalidProtocol();
@@ -278,28 +432,47 @@ contract BondManager is
         _deRegisterProtocol(protocol, pType);
     }
 
-    // ============ BOND LIFECYCLE ============
+    //============================================================================
+    // BOND CREATION & DEPLOYMENT
+    //============================================================================
 
-    /// @notice Create bond with protocol: deploy capital, start vesting
-    /// @dev Uses CHECKS-EFFECTS-INTERACTIONS pattern:
-    /// 1. Validate all conditions (discount, tier, capacity)
-    /// 2. Create bond record and update state
-    /// 3. Transfer USDC and update vault deployment tracking
-    /// @param protocol Protocol address (auto-registers if not already)
-    /// @param protocolToken Token that protocol will provide
+    /// @notice Create bond: deploy USDC to protocol, receive vesting tokens in return
+    /// @dev Implements CHECKS-EFFECTS-INTERACTIONS pattern for safety:
+    ///      1. CHECKS: Validate tier, discount, capacity constraints upfront
+    ///      2. EFFECTS: Update bond storage, deployment tracking, counters
+    ///      3. INTERACTIONS: Execute vault transfers and state updates
+    ///      Ensures state consistency even if external calls fail
+    ///
+    ///      Vesting: Linear over vestingDays (30/60/90 only). Tier→discount mapping:
+    ///      - 30 days (tier 0): 30% discount minimum
+    ///      - 60 days (tier 1): 25% discount minimum
+    ///      - 90 days (tier 2): 20% discount minimum
+    ///
+    ///      Capacity & Concentration:
+    ///      - Queries availableTierCapacity from vault
+    ///      - Per-protocol limit = availableCapacity * maxBondTvlPercent / 100
+    ///      - Default maxBondTvlPercent=25%, so max 25% of tier capacity to single protocol
+    ///      - Prevents counterparty concentration risk
+    ///
+    /// @param protocol Protocol receiving USDC (auto-registered if not exists)
+    /// @param protocolToken ERC20 token protocol vests to us
     /// @param usdcAmount USDC to deploy (6 decimals)
-    /// @param tokenAmount Total tokens protocol will provide
-    /// @param tier Lockup tier: 0=30d (30% disc), 1=60d (25%), 2=90d (20%)
-    /// @param discount Discount percentage in bps (2000 = 20%)
-    /// @param vestingDays Vesting duration (30/60/90 required)
-    /// @param protocolType_ Protocol type (for auto-registration only)
+    /// @param tokenAmount Total protocol tokens to vest
+    /// @param tier Lockup tier (0=30d, 1=60d, 2=90d) must match vestingDays
+    /// @param discount Discount applied (e.g., 3000=30%, must meet tier minimum)
+    /// @param vestingDays Total days until fully vested (30, 60, or 90 only)
+    /// @param protocolType_ Protocol category if new registration needed
+    ///
+    /// @custom:important Bond created with ID=bondCounter; BondCreated event emitted
+    ///
+    /// @custom:precondition protocol and protocolToken must be non-zero
+    /// @custom:precondition usdcAmount and tokenAmount > 0
     /// @custom:precondition discount >= minDiscountPerTier[tier]
-    /// @custom:precondition vestingDays must be 30, 60, or 90
-    /// @custom:precondition Available tier capacity >= usdcAmount
-    /// @custom:precondition currentDeployed[protocol] + usdcAmount <= maxPerProtocol
-    /// @custom:postcondition Bond created with startTime=now, endTime=now+vestingDays*1day
-    /// @custom:postcondition USDC transferred from vault to protocol
-    /// @custom:postcondition totalDeployedByTier[tier] increases by usdcAmount
+    /// @custom:precondition vestingDays in {30, 60, 90} and matches tier
+    /// @custom:precondition availableInTier >= usdcAmount (vault capacity check)
+    /// @custom:precondition currentDeployedByProtocol[id] + usdcAmount <= maxPerProtocol
+    /// @custom:postcondition Bond created marked active; vault.markDeployed called
+    /// @custom:postcondition totalUsdcDeployed and currentDeployedByProtocol incremented
     function createBond(
         address protocol,
         address protocolToken,
@@ -384,9 +557,14 @@ contract BondManager is
         );
     }
 
+    //============================================================================
+    // HELPERS & QUERIES
+    //============================================================================
+
     /// @notice Convert vesting days to tier index
-    /// @param vestingDays Number of days (must be 30, 60, or 90)
-    /// @return Tier index: 0=30d, 1=60d, 2=90d
+    /// @dev Only accepts 30, 60, 90 days (no arbitrary values)
+    /// @param vestingDays Vesting period in days
+    /// @return tier Tier index: 0=30d, 1=60d, 2=90d
     function _vestingDaysToTier(
         uint256 vestingDays
     ) internal pure returns (uint8) {
@@ -396,18 +574,16 @@ contract BondManager is
         revert InvalidTier();
     }
 
-    // ============ BOND QUERIES ============
-
-    /// @notice Query complete bond data
-    /// @param bondId Bond ID to query
-    /// @return Bond struct with all lifecycle data
+    /// @notice Fetch complete bond details
+    /// @param bondId Bond ID
+    /// @return Bond struct with all state (deployment, vesting, claims, lifecycle)
     function getBondData(uint256 bondId) external view returns (Bond memory) {
         return bonds[bondId];
     }
 
-    /// @notice Query all bond IDs for a protocol
+    /// @notice Fetch all bond IDs for a protocol
     /// @param protocol Protocol address
-    /// @return Array of bond IDs where protocol is counterparty
+    /// @return Array of bond IDs associated with protocol
     function getProtocolActiveBonds(
         address protocol
     ) external view returns (uint256[] memory) {
@@ -417,10 +593,16 @@ contract BondManager is
         return protocolBonds[protocolId];
     }
 
-    /// @notice Calculate amount of tokens that have vested so far (linear schedule)
-    /// @dev Vesting = tokenAmount * elapsedTime / vestingPeriod
-    /// @param bondId Bond ID to query
-    /// @return Vested tokens (max = tokenAmount at endTime)
+    //============================================================================
+    // VESTING & CLAIMING QUERIES
+    //============================================================================
+
+    /// @notice Query amount of tokens vested on bond at current time
+    /// @dev Linear vesting: vestedAmount = tokenAmount * (now - startTime) / vestingDays
+    ///      Returns full tokenAmount if vesting complete (now >= endTime)
+    /// @param bondId Bond ID
+    /// @return Tokens vested and eligibile to claim (may not all be claimed yet)
+    /// @custom:precondition Bond must exist and be active
     function getVestedAmount(uint256 bondId) public view returns (uint256) {
         Bond storage bond = bonds[bondId];
         if (bond.bondId == 0 || !bond.active) revert InvalidBond();
@@ -432,9 +614,11 @@ contract BondManager is
         return Math.mulDiv(bond.tokenAmount, elapsed, vestingPeriod);
     }
 
-    /// @notice Calculate tokens available to claim (vested - already claimed)
-    /// @param bondId Bond ID to query
-    /// @return Claimable tokens (0 if all vested tokens already claimed)
+    /// @notice Query amount of vested tokens not yet claimed
+    /// @dev Returns (vested - claimed), which is available to claim from protocol
+    /// @param bondId Bond ID
+    /// @return Tokens available to claim from protocol
+    /// @custom:precondition Bond must exist and be active
     function getClaimableAmount(uint256 bondId) public view returns (uint256) {
         Bond storage bond = bonds[bondId];
         if (bond.bondId == 0 || !bond.active) revert InvalidBond();
@@ -443,12 +627,13 @@ contract BondManager is
         return claimableAmount;
     }
 
-    /// @notice Query complete bond status (vesting progress, remaining time)
-    /// @param bondId Bond ID to query
+    /// @notice Get comprehensive bond status snapshot
+    /// @dev Returns vesting progress, claimable amount, and time remaining
+    /// @param bondId Bond ID
     /// @return vestedAmount Tokens vested so far
-    /// @return claimableAmount Tokens ready to claim (not yet claimed)
-    /// @return vestingPercentage Completion percentage (0-100)
-    /// @return daysRemaining Days until vesting ends (0 if ended)
+    /// @return claimableAmount Tokens vested but not claimed
+    /// @return vestingPercentage Current vesting progress (0-100%)
+    /// @return daysRemaining Days until vesting complete
     function getBondStatus(
         uint256 bondId
     )
@@ -479,14 +664,20 @@ contract BondManager is
             : (bond.endTime - block.timestamp) / 1 days;
     }
 
-    // ============ TOKEN CLAIMING ============
+    //============================================================================
+    // TOKEN CLAIMING
+    //============================================================================
 
-    /// @notice Claim vested tokens from protocol (admin only)
-    /// @dev Transfers tokens FROM protocol TO this contract
-    /// @param bondId Bond ID to claim from
-    /// @param amount Tokens to claim (must be <= getClaimableAmount)
-    /// @return amount Tokens claimed
-    /// @custom:postcondition tokensClaimed increases by amount
+    /// @notice Claim vested tokens from protocol during vesting
+    /// @dev Called to pull protocol tokens into BondManager as they vest.
+    ///      This is the "token reception" step. Claimed tokens can then be
+    ///      swapped via sellBondTokens() to extract profit.
+    ///
+    /// @param bondId Bond ID
+    /// @param amount Amount of tokens to claim from protocol (must be <= claimable)
+    /// @return Amount actually claimed
+    /// @custom:precondition amount must be <= getClaimableAmount(bondId)
+    /// @custom:postcondition bond.tokensClaimed incremented, tokens transferred from protocol
     function claimBond(
         uint256 bondId,
         uint256 amount
@@ -519,28 +710,48 @@ contract BondManager is
         return amount;
     }
 
-    // ============ PROFIT EXTRACTION ============
+    //============================================================================
+    // PROFIT EXTRACTION & CONFIGURATION
+    //============================================================================
 
-    /// @notice Set maximum % of tier capacity per protocol (admin only)
-    /// @param newPercent Percentage (0-100, default 25%)
+    /// @notice Update maximum deployment per protocol as % of tier capacity
+    /// @param newPercent Percentage (1-100), default 25%
     function setMaxBondTvlPercent(uint256 newPercent) public onlyOwner {
         if (newPercent == 0 || newPercent > 100) revert InvalidConditions();
         maxBondTvlPercent = newPercent;
     }
 
-    /// @notice Sell claimed tokens on DEX for profit, route to RewardPool
-    /// @dev Calculates profit = salePrice - (costBasis * amountSold).
-    /// If all tokens are sold, marks bond as inactive and returns capital to vault.
-    /// @param bondId Bond ID to sell tokens from
-    /// @param amount Tokens to sell (must be <= tokensProcessed - already sold)
-    /// @param minUsdcOut Minimum USDC expected from swap (slippage protection)
-    /// @param rewardPool RewardPool address (receives profit)
-    /// @return usdcReceived USDC received from sale
-    /// @return profit Profit extracted (salePrice - costBasis)
-    /// @custom:precondition amount <= getClaimableAmount (claimed but not yet sold)
+    /// @notice Sell claimed bond tokens for USDC and extract profit to RewardPool
+    /// @dev Core profit extraction mechanism. Profit calculated using cost basis:
+    ///      costBasisPerToken = usdcProvided / tokenAmount
+    ///      costOfTokensSold = amount * costBasisPerToken
+    ///      profit = usdcReceived - costOfTokensSold
+    ///
+    ///      Example:
+    ///      - Deploy 1000 USDC at 20% discount (bond terms)
+    ///      - Receive 1000 tokens (cost basis = 1 USDC per token)
+    ///      - Token market price rises to 1.25 USDC (arbitrage opportunity)
+    ///      - Sell 1000 tokens for 1250 USDC (if fully appreciated)
+    ///      - Cost of tokens = (1000 * 1000) / 1000 = 1000 USDC
+    ///      - Profit = 1250 - 1000 = 250 USDC → routed to RewardPool
+    ///
+    ///      Bond Lifecycle:
+    ///      - When tokensProcessed == tokenAmount: mark bond inactive
+    ///      - Release USDC from deployed tracking (calls vault.markReturned)
+    ///      - Capital now available for new deployments or user withdrawals
+    ///
+    /// @param bondId Bond ID
+    /// @param amount Amount of claimed tokens to swap (must be <= claimed - processed)
+    /// @param minUsdcOut Slippage tolerance for DEX swap (minimum USDC expected)
+    /// @param rewardPool RewardPool address to receive profit
+    /// @return usdcReceived USDC obtained from DEX swap
+    /// @return profit Profit extracted and routed to RewardPool (0 if no profit)
+    ///
+    /// @custom:precondition amount must be > 0 and <= (tokensClaimed - tokensProcessed)
     /// @custom:precondition rewardPool must be non-zero
-    /// @custom:postcondition If all tokens sold: bond marked inactive, markReturned called
-    /// @custom:postcondition Profit transferred to rewardPool
+    /// @custom:postcondition tokensProcessed incremented
+    /// @custom:postcondition If fully processed: bond marked inactive, vault.markReturned called
+    /// @custom:postcondition USDC transferred to rewardPool, TokensSold event emitted
     function sellBondTokens(
         uint256 bondId,
         uint256 amount,
@@ -593,11 +804,10 @@ contract BondManager is
 
         usdcReceived = amounts[amounts.length - 1];
 
-        // PROFIT CALCULATION
-        // cost basis per token = bond.usdcProvided / bond.tokenAmount
-        // cost of tokens sold = amount * costBasisPerToken
-        // profit = usdcReceived - costOfTokensSold
-        // use Math.mulDiv to avoid overflow
+        // Calculate profit using cost basis
+        // costBasis = usdcProvided / tokenAmount (per token)
+        // costOfTokensSold = amount * costBasis = (usdcProvided * amount) / tokenAmount
+        // profit = usdcReceived - costOfTokensSold (0 if no profit)
         uint256 costOfTokensSold = Math.mulDiv(
             bond.usdcProvided,
             amount,
@@ -607,7 +817,7 @@ contract BondManager is
             ? usdcReceived - costOfTokensSold
             : 0;
 
-        // Send profit to RewardPool for user distribution
+        // Send profit to RewardPool
         if (profit > 0) {
             usdc.safeTransfer(rewardPool, profit);
         }
@@ -623,18 +833,27 @@ contract BondManager is
             bond.vestingDays
         );
     }
+    
+    //============================================================================
+    // EMERGENCY OPERATIONS
+    //============================================================================
 
-    // ============ EMERGENCY EXIT ============
-
-    /// @notice Emergency exit from bond: recover vested but unclaimed tokens (admin only)
-    /// @dev Does NOT force sell tokens. Owner must call sellBondTokens separately if desired.
-    /// Marks bond as inactive and returns capital to vault.
-    /// @param bondId Bond ID to exit
-    /// @param minUsdcOut Unused (for compatibility)
-    /// @param rewardPool RewardPool address (for compatibility)
-    /// @custom:postcondition Bond marked inactive
-    /// @custom:postcondition markReturned called to update vault
-    /// @custom:postcondition Vested but unclaimed tokens recovered to this contract
+    /// @notice Emergency exit bond: mark inactive and release deployment tracking
+    /// @dev Used when protocol goes dark, partnership terminates, or recovery needed.
+    ///      Allows claiming any vested but unclaimed tokens and releasing USDC from
+    ///      deployed tracking. Tokens can be manually recovered via sellBondTokens()
+    ///      or left in contract for manual recovery if profitable later.
+    ///
+    ///      Capital Release:
+    ///      - Calls vault.markReturned() to release USDC from deployed tracking
+    ///      - Makes capital available for new deployments or user withdrawals
+    ///      - Does NOT increase totalUsdcReturned (not a normal completion)
+    ///
+    /// @param bondId Bond ID
+    /// @param minUsdcOut Slippage tolerance (reserved for future token swap logic)
+    /// @param rewardPool RewardPool address (reserved for future profit routing)
+    /// @custom:precondition Bond must be active
+    /// @custom:postcondition Bond marked inactive, deployment released, BondExited emitted
     function emergencyExitBond(uint256 bondId, uint256 minUsdcOut, address rewardPool) external onlyOwner nonReentrant {
         Bond storage bond = bonds[bondId];
         if (bond.bondId == 0 || !bond.active) revert InvalidBond();
@@ -645,6 +864,7 @@ contract BondManager is
         uint256 unclaimedVested = vestedAmount - bond.tokensClaimed;
         bond.tokensClaimed += unclaimedVested;
     
+
         bond.active = false;
         
         if (unclaimedVested > 0) {
@@ -653,12 +873,15 @@ contract BondManager is
                 address(this),
                 unclaimedVested
             );
+            
+            // Owner can call sellBondTokens() separately to swap for profit
         }
         
-        // Update deployment tracking (protocol no longer owes USDC interest)
+        // Release deployment tracking (capital no longer committed)
         currentDeployedByProtocol[bond.protocolId] -= bond.usdcProvided;
+        
         vault.markReturned(bond.tier, bond.usdcProvided);
-    
+
         emit BondExited(
             bond.bondId,
             bond.protocol,
