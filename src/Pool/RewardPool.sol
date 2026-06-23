@@ -1,5 +1,5 @@
 //SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "src/Interfaces/IVaultManager.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -37,7 +37,7 @@ contract RewardPool is
     /// @notice USDC token (6 decimals, the reward token being distributed)
     IERC20 public usdc;
     
-    /// @notice Vault reference (QVToken) for user weight and deposit queries
+    /// @notice Vault reference (QuestToken) for user weight and deposit queries
     IVaultManager public vault;
     
     /// @notice Global accumulating reward index (in wei)
@@ -68,7 +68,7 @@ contract RewardPool is
     /// @notice Initialize reward pool with vault, USDC, and owner
     /// @dev Sets up references for weight calculation and reward distribution
     /// @param initialOwner Owner address (manages pause, treasury functions)
-    /// @param _vault IVaultManager contract (QVToken) for deposit/weight queries
+    /// @param _vault IVaultManager contract (QuestToken) for deposit/weight queries
     /// @param _usdc USDC token contract (reward token to distribute)
     /// @custom:precondition All addresses must be non-zero
     function initialize(
