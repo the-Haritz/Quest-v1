@@ -1,5 +1,5 @@
 //SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "src/Interfaces/IVaultManager.sol";
 import "src/Interfaces/IDexRouter.sol";
@@ -820,6 +820,12 @@ contract BondManager is
         // Send profit to RewardPool
         if (profit > 0) {
             usdc.safeTransfer(rewardPool, profit);
+        }
+
+        // Send principal back to Vault
+        uint256 principalReturned = usdcReceived > profit ? usdcReceived - profit : 0;
+        if (principalReturned > 0) {
+            usdc.safeTransfer(address(vault), principalReturned);
         }
 
         emit TokensSold(

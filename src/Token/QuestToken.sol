@@ -1,7 +1,8 @@
 //SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "src/Interfaces/IVaultManager.sol";
+import "src/Interfaces/IRewardPool.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
@@ -11,7 +12,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title QVToken - Quest Vault Token (QuantumToken)
+/// @title QuestToken - Quest Vault Token
 /// @author Quest Team
 /// @notice ERC20 deposit vault accepting USDC with tiered lockups (30/60/90 days) earning weighted rewards
 /// @dev Implements upgradeable ERC20 vault with:
@@ -19,7 +20,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 /// - Weighted reward distribution via RewardPool (1.0x/1.5x/2.0x multipliers by tier)
 /// - Capital deployment tracking for BondManager partnerships
 /// - Pausable emergency controls
-contract QVToken is
+contract QuestToken is
     Initializable,
     ERC20Upgradeable,
     OwnableUpgradeable,
@@ -76,6 +77,14 @@ contract QVToken is
     /// Updated when bonds are created (marked deployed) or completed (marked returned)
     mapping(LockupPeriod => uint256) public totalDeployedByTier;
 
+    /// @notice Maps account to authorization state as manager
+    mapping(address => bool) public managers;
+
+    /// @notice RewardPool reference for snapshotting rewardDebt at deposit time
+    /// @dev If set, deposit() queries rewardPool.rewardIndex() to initialize rewardDebt
+    /// preventing late depositors from claiming rewards accrued before their deposit
+    IRewardPool public rewardPool;
+
     // ============ EVENTS ============
 
     event Deposited(
@@ -97,12 +106,14 @@ contract QVToken is
         address indexed oldVaultManager,
         address indexed newVaultManager
     );
+    event ManagerUpdated(address indexed manager, bool state);
+    event RewardPoolUpdated(address indexed oldRewardPool, address indexed newRewardPool);
 
     // ============ INITIALIZATION ============
 
     /// @notice Initialize vault with owner, constraints, and token references
     /// @dev Can only be called once (initializer guard enforced by Upgradeable pattern).
-    /// Sets up ERC20 token "Quantum Token" (QTK), ownership, and pausable state.
+    /// Sets up ERC20 token "Quest Token" (QUEST), ownership, and pausable state.
     /// @param initialOwner Address that will own the vault (controls pause, TVL, discount adjustments)
     /// @param _vaultManager Vault manager reference (used for manager authorization checks)
     /// @param _usdc USDC token contract address (6 decimals, the deposit collateral)
@@ -124,7 +135,7 @@ contract QVToken is
             revert ZeroAddress();
         }
 
-        __ERC20_init("Quantum Token", "QTK");
+        __ERC20_init("Quest Token", "QUEST");
         __Ownable_init(initialOwner);
         __Pausable_init();
 
@@ -144,13 +155,13 @@ contract QVToken is
 
     // ============ DEPOSIT / WITHDRAWAL ============
 
-    /// @notice Deposit USDC into vault with chosen lockup tier, mint QTK 1:1
+    /// @notice Deposit USDC into vault with chosen lockup tier, mint QUEST 1:1
     /// @dev Creates a new DepositReceipt with lockup timestamp calculated from current block time.
     /// Tier multiplier determines reward weight: THIRTY_DAYS=1.0x, SIXTY_DAYS=1.5x, NINETY_DAYS=2.0x.
     /// Enforces min/max deposit constraints and updates global weighted supply.
     /// @param assets Amount of USDC to deposit (6 decimals, e.g., 1e8 = 100 USDC)
     /// @param lockupPeriod Enum selection: THIRTY_DAYS (0), SIXTY_DAYS (1), or NINETY_DAYS (2)
-    /// @return qtkMinted Amount of QTK minted to caller (equals assets due to 1:1 ratio)
+    /// @return questMinted Amount of QUEST minted to caller (equals assets due to 1:1 ratio)
     /// @custom:precondition Caller has called usdc.approve(this, assets) first
     /// @custom:precondition assets >= minDeposit and assets > 0
     /// @custom:precondition totalDeposited + assets <= maxTVL
@@ -158,16 +169,26 @@ contract QVToken is
     /// @custom:postcondition User's weighted balance increases by: assets * multiplier[tier]
     /// @custom:postcondition totalWeightedSupply increases accordingly
     /// @custom:postcondition New DepositReceipt created with lockupEnd = block.timestamp + duration[tier]
-    /// @custom:postcondition Caller receives QTK equal to assets
+    /// @custom:postcondition Caller receives QUEST equal to assets
     function deposit(
         uint256 assets,
         LockupPeriod lockupPeriod
-    ) external whenNotPaused nonReentrant returns (uint256 qtkMinted) {
+    ) external whenNotPaused nonReentrant returns (uint256 questMinted) {
         if (assets == 0) revert InvalidAmount();
         if (assets < minDeposit) revert MinDepositNotMet(minDeposit, assets);
 
         uint256 newTVL = totalDeposited + assets;
         if (newTVL > maxTVL) revert MaxTVLExceeded(maxTVL, newTVL);
+
+        // Calculate initial rewardDebt to prevent late-depositor reward theft
+        // This snapshots the current rewardIndex so the depositor can only claim
+        // rewards that accrue AFTER their deposit, not before
+        uint256 weight = Math.mulDiv(assets, _multiplier(lockupPeriod), 1e18);
+        uint256 initialRewardDebt = 0;
+        if (address(rewardPool) != address(0)) {
+            uint256 currentIndex = rewardPool.rewardIndex();
+            initialRewardDebt = Math.mulDiv(currentIndex, weight, 1e18);
+        }
 
         uint256 lockupEnd = block.timestamp + _lockupDuration(lockupPeriod);
         userDeposits[msg.sender].push(
@@ -176,21 +197,21 @@ contract QVToken is
                 tier: lockupPeriod,
                 lockupEnd: lockupEnd,
                 expiryCounted: false,
-                rewardDebt: 0
+                rewardDebt: initialRewardDebt
             })
         );
         totalLockedByTier[lockupPeriod] += assets;
 
         usdc.safeTransferFrom(msg.sender, address(this), assets);
 
-        qtkMinted = assets;
-        _mint(msg.sender, qtkMinted);
+        questMinted = assets;
+        _mint(msg.sender, questMinted);
         totalDeposited = newTVL;
-        totalWeightedSupply += Math.mulDiv(assets, _multiplier(lockupPeriod), 1e18);
+        totalWeightedSupply += weight;
 
         emit Deposited(msg.sender, assets, lockupPeriod, lockupEnd);
 
-        return qtkMinted;
+        return questMinted;
     }
 
     /// @notice Return withdrawable amount for a user (sum of expired deposits)
@@ -214,24 +235,24 @@ contract QVToken is
         return withdrawableAmount;
     }
 
-    /// @notice Withdraw USDC from vault, burn QTK, update weighted supply
+    /// @notice Withdraw USDC from vault, burn QUEST, update weighted supply
     /// @dev Implements FIFO withdrawal from expired deposits only. Correctly tracks weight reduction
     /// by summing the actual tier multipliers of withdrawn deposits (not using a parameter).
     /// @param assets Amount of USDC to withdraw (6 decimals)
     /// @param receiver Address to receive the USDC
-    /// @return qtkBurned Amount of QTK burned (equals assets)
+    /// @return questBurned Amount of QUEST burned (equals assets)
     /// @custom:precondition assets <= getWithdrawableAmount(caller)
     /// @custom:precondition assets > 0
-    /// @custom:precondition Caller must have at least assets QTK
+    /// @custom:precondition Caller must have at least assets QUEST
     /// @custom:precondition Withdrawals must not be paused
-    /// @custom:postcondition QTK burned from caller = assets
+    /// @custom:postcondition QUEST burned from caller = assets
     /// @custom:postcondition USDC transferred to receiver = assets
     /// @custom:postcondition totalWeightedSupply reduced by sum of (withdrawn_amount * tier_multiplier)
     /// @custom:postcondition Deposit records updated (amount set to 0 for fully withdrawn)
     function withdraw(
         uint256 assets,
         address receiver
-    ) external whenNotPaused nonReentrant returns (uint256 qtkBurned) {
+    ) external whenNotPaused nonReentrant returns (uint256 questBurned) {
         if (receiver == address(0)) revert ZeroAddress();
         if (assets == 0) revert InvalidAmount();
 
@@ -275,15 +296,15 @@ contract QVToken is
             }
         }
 
-        qtkBurned = assets;
-        _burn(msg.sender, qtkBurned);
+        questBurned = assets;
+        _burn(msg.sender, questBurned);
         totalDeposited -= assets;
         totalWeightedSupply -= weightToReduce;
         usdc.safeTransfer(receiver, assets);
 
         emit Withdrawn(msg.sender, receiver, assets);
 
-        return qtkBurned;
+        return questBurned;
     }
 
     // ============ USER QUERIES ============
@@ -318,7 +339,7 @@ contract QVToken is
     /// @return Total USDC locked in tier (not yet deployed)
     function getProtocolLockedByTier(
         uint8 tier
-    ) external view onlyOwner returns (uint256) {
+    ) external view returns (uint256) {
         LockupPeriod lockupTier = LockupPeriod(tier);
         return totalLockedByTier[lockupTier];
     }
@@ -328,7 +349,7 @@ contract QVToken is
     /// @return Total USDC deployed via BondManager in tier
     function getProtocolDeployedByTier(
         uint8 tier
-    ) external view onlyOwner returns (uint256) {
+    ) external view returns (uint256) {
         LockupPeriod lockupTier = LockupPeriod(tier);
         return totalDeployedByTier[lockupTier];
     }
@@ -338,7 +359,7 @@ contract QVToken is
     /// @return Available USDC = locked - deployed (capacity for new bonds)
     function getProtocolAvailableByTier(
         uint8 tier
-    ) external view onlyOwner returns (uint256) {
+    ) external view returns (uint256) {
         LockupPeriod lockupTier = LockupPeriod(tier);
         return totalLockedByTier[lockupTier] - totalDeployedByTier[lockupTier];
     }
@@ -393,11 +414,11 @@ contract QVToken is
     // ============ AUTHORIZATION ============
 
     /// @notice Check if account is authorized manager (used by BondManager and RewardPool)
-    /// @dev Currently allows only owner as manager
+    /// @dev Allows owner and accounts explicitly set in managers mapping
     /// @param account Address to check
     /// @return bool True if account is authorized manager
     function isManager(address account) external view returns (bool) {
-        return account == owner();
+        return account == owner() || managers[account];
     }
 
     // ============ REWARD POOL CALLS ============
@@ -413,11 +434,11 @@ contract QVToken is
 
     /// @notice Update user's reward debt after claim (called by RewardPool)
     /// @dev Persists the user's current accumulated reward state to prevent double-claiming
-    /// Only callable by owner (RewardPool owner)
+    /// Only callable by owner or authorized manager/RewardPool
     /// @param user Address whose reward debt to update
     /// @param depositIndex Index in userDeposits[user] array
     /// @param newRewardDebt New rewardIndex snapshot for this deposit
-    /// @custom:precondition msg.sender must be owner (RewardPool owner)
+    /// @custom:precondition msg.sender must be owner or authorized manager
     /// @custom:precondition depositIndex must be valid index in userDeposits[user]
     /// @custom:postcondition userDeposits[user][depositIndex].rewardDebt = newRewardDebt
     function updateRewardDebt(
@@ -425,12 +446,21 @@ contract QVToken is
         uint256 depositIndex,
         uint256 newRewardDebt
     ) external {
-        require(msg.sender == owner(), "Only owner can update reward debt");
+        require(msg.sender == owner() || managers[msg.sender], "Only owner or manager can update reward debt");
         require(depositIndex < userDeposits[user].length, "Invalid deposit index");
         userDeposits[user][depositIndex].rewardDebt = newRewardDebt;
     }
 
     // ============ ADMIN CONTROLS ============
+
+    /// @notice Set authorization state for a manager address (owner only)
+    /// @param manager Address to update
+    /// @param state True to authorize, false to revoke
+    function setManager(address manager, bool state) external onlyOwner {
+        if (manager == address(0)) revert ZeroAddress();
+        managers[manager] = state;
+        emit ManagerUpdated(manager, state);
+    }
 
     /// @notice Set minimum deposit amount (admin only)
     /// @param newMinDeposit New minimum USDC per deposit (6 decimals)
@@ -468,6 +498,15 @@ contract QVToken is
     /// @notice Resume deposits after emergency pause (admin only)
     function unpauseDeposits() external onlyOwner {
         _unpause();
+    }
+
+    /// @notice Set reward pool reference for rewardDebt initialization (admin only)
+    /// @dev Must be set after RewardPool is deployed so deposit() can snapshot rewardIndex
+    /// @param _rewardPool Address of the RewardPool contract
+    function setRewardPool(IRewardPool _rewardPool) external onlyOwner {
+        address oldRewardPool = address(rewardPool);
+        rewardPool = _rewardPool;
+        emit RewardPoolUpdated(oldRewardPool, address(_rewardPool));
     }
 
     // ============ WEIGHT / REWARD CALCULATIONS ============

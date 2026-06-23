@@ -1,5 +1,5 @@
 [profile.default]
-solc = "0.8.20"
+solc = "0.8.22"
 optimizer = true
 optimizer_runs = 200
 via_ir = true
@@ -9,3 +9,9 @@ libs = ["lib"]
 
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+[invariant]
+runs = 512
+depth = 50
+fail_on_revert = false
+dictionary_weight = 80
