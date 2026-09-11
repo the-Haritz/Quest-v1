@@ -253,7 +253,11 @@ forge coverage --ir-minimum
 ---
 ## 10. About Contributions
 
-Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via gh and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity
+This repo is open source (MIT), but it's a solo project. To protect my time and maintain strict control over contract security, I do not accept or merge outside pull requests directly.
+
+Detailed bug reports and issues are very welcome. If you run into a bug or an edge case, please open an issue with a minimal reproduction script or a failing Foundry test. If you choose to write a PR to illustrate a fix, I’ll gladly review the concept and implement the patch independently if it fits the architecture.
+
+Forking and experimenting under the MIT license is always encouraged, but the main branch will remain strictly solo-maintained so I can move fast without burning out.
 
 ---
 ## 11. What's Next (Izumi)
